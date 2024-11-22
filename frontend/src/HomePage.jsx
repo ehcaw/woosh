@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,44 +14,99 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Database, MessageSquare, BarChart, Code, Cpu } from "lucide-react";
 
+const API_BASE_URL = "http://localhost:5000/api/v1";
+
 export default function WooshHomePage() {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState("");
   const [messageIdCounter, setMessageIdCounter] = useState(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [dbStatus, setDbStatus] = useState(null);
 
-  const addMessage = (text, sender, sqlQuery, queryResult) => {
+  useEffect(() => {
+    // Check database health on component mount
+    checkDatabaseHealth();
+  }, []);
+
+  const checkDatabaseHealth = async () => {
+    try {
+      const response = await fetch("http://localhost:5000/health");
+      const data = await response.json();
+      setDbStatus(data.status === "healthy");
+    } catch (error) {
+      setDbStatus(false);
+      console.error("Health check failed:", error);
+    }
+  };
+
+  const addMessage = (text, sender, sqlQuery, queryResult, error) => {
     const newMessage = {
       id: messageIdCounter,
       text,
       sender,
       sqlQuery,
       queryResult,
+      error,
+      timestamp: new Date(),
     };
-    setMessages([...messages, newMessage]);
-    setMessageIdCounter(messageIdCounter + 1);
+    setMessages((prev) => [...prev, newMessage]);
+    setMessageIdCounter((prev) => prev + 1);
     setInputValue("");
   };
 
   const removeMessage = (id) => {
-    setMessages(messages.filter((message) => message.id !== id));
+    setMessages((prev) => prev.filter((message) => message.id !== id));
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (inputValue.trim()) {
-      addMessage(inputValue, "user");
-      // Simulate SQL translation and query execution (replace with actual implementation)
-      setTimeout(() => {
-        const simulatedSqlQuery = `SELECT * FROM users WHERE name LIKE '%${inputValue}%'`;
-        const simulatedQueryResult =
-          "Query executed successfully. 5 rows returned.";
+    if (!inputValue.trim() || isLoading) return;
+
+    setIsLoading(true);
+    addMessage(inputValue, "user");
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/convert`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: inputValue,
+          execute: true, // Set to true to get query results
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.status === "success" || data.status === "warning") {
         addMessage(
-          "I've translated your request to SQL and executed the query.",
+          data.status === "warning" 
+            ? `Warning: ${data.warnings}\nSuggested Fix Applied` 
+            : "Query processed successfully",
           "system",
-          simulatedSqlQuery,
-          simulatedQueryResult,
+          data.sql_query,
+          data.results || "Query executed successfully",
         );
-      }, 1000);
+      } else {
+        addMessage(
+          "Error processing query",
+          "system",
+          null,
+          null,
+          data.error || "Unknown error occurred"
+        );
+      }
+    } catch (error) {
+      addMessage(
+        "Failed to connect to the server",
+        "system",
+        null,
+        null,
+        error.message
+      );
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -63,19 +118,22 @@ export default function WooshHomePage() {
             <Database className="h-8 w-8 text-indigo-500 mr-2" />
             <h1 className="text-2xl font-bold text-gray-900">Woosh</h1>
           </div>
-          <nav>
-            <ul className="flex space-x-4">
-              <li>
-                <Button variant="ghost">Home</Button>
-              </li>
-              <li>
-                <Button variant="ghost">Documentation</Button>
-              </li>
-              <li>
-                <Button variant="ghost">Pricing</Button>
-              </li>
-            </ul>
-          </nav>
+          <div className="flex items-center gap-4">
+            <div className={`flex items-center ${dbStatus ? 'text-green-500' : 'text-red-500'}`}>
+              <div className={`w-2 h-2 rounded-full ${dbStatus ? 'bg-green-500' : 'bg-red-500'} mr-2`}></div>
+              {dbStatus ? 'Connected' : 'Disconnected'}
+            </div>
+            <nav>
+              <ul className="flex space-x-4">
+                <li>
+                  <Button variant="ghost">Home</Button>
+                </li>
+                <li>
+                  <Button variant="ghost">Documentation</Button>
+                </li>
+              </ul>
+            </nav>
+          </div>
         </div>
       </header>
 
@@ -108,32 +166,32 @@ export default function WooshHomePage() {
                     >
                       <div className="flex items-start gap-3">
                         <Avatar>
-                          <AvatarImage
-                            src={
-                              message.sender === "user"
-                                ? "/user-avatar.png"
-                                : "/system-avatar.png"
-                            }
-                          />
                           <AvatarFallback>
                             {message.sender === "user" ? "U" : "S"}
                           </AvatarFallback>
                         </Avatar>
-                        <div>
+                        <div className="flex-1">
                           <p className="font-semibold">
                             {message.sender === "user" ? "You" : "Woosher"}
                           </p>
                           <p>{message.text}</p>
                           {message.sqlQuery && (
                             <div className="mt-2 p-2 bg-gray-800 text-green-400 rounded">
-                              <p className="text-xs font-mono">
-                                {message.sqlQuery}
-                              </p>
+                              <p className="text-xs font-mono">{message.sqlQuery}</p>
                             </div>
                           )}
                           {message.queryResult && (
                             <div className="mt-2 p-2 bg-gray-100 rounded">
-                              <p className="text-xs">{message.queryResult}</p>
+                              <pre className="text-xs overflow-x-auto">
+                                {typeof message.queryResult === 'string' 
+                                  ? message.queryResult 
+                                  : JSON.stringify(message.queryResult, null, 2)}
+                              </pre>
+                            </div>
+                          )}
+                          {message.error && (
+                            <div className="mt-2 p-2 bg-red-100 text-red-600 rounded">
+                              <p className="text-xs">{message.error}</p>
                             </div>
                           )}
                         </div>
@@ -156,8 +214,11 @@ export default function WooshHomePage() {
                     onChange={(e) => setInputValue(e.target.value)}
                     placeholder="Describe your query in natural language..."
                     className="flex-grow"
+                    disabled={isLoading || !dbStatus}
                   />
-                  <Button type="submit">Translate & Execute</Button>
+                  <Button type="submit" disabled={isLoading || !dbStatus}>
+                    {isLoading ? "Processing..." : "Translate & Execute"}
+                  </Button>
                 </form>
               </TabsContent>
               <TabsContent value="history">
@@ -171,63 +232,18 @@ export default function WooshHomePage() {
             </Tabs>
           </CardContent>
         </Card>
-
-        <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-6">
-          <Card>
-            <CardHeader>
-              <CardTitle>Natural Language to SQL</CardTitle>
-              <CardDescription>Effortless query translation</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <MessageSquare className="h-12 w-12 text-indigo-500 mb-4" />
-              <p>
-                Transform your natural language requests into precise SQL
-                queries with our advanced AI technology.
-              </p>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle>Intelligent Query Execution</CardTitle>
-              <CardDescription>Powered by AI agents</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Cpu className="h-12 w-12 text-green-500 mb-4" />
-              <p>
-                Our AI agents execute your queries efficiently, optimizing for
-                performance and accuracy.
-              </p>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle>Advanced Data Operations</CardTitle>
-              <CardDescription>Beyond simple queries</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Code className="h-12 w-12 text-purple-500 mb-4" />
-              <p>
-                Perform complex data operations and transformations on your
-                query results with ease.
-              </p>
-            </CardContent>
-          </Card>
-        </div>
       </main>
 
       <footer className="bg-gray-100 mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
           <div className="flex justify-between items-center">
-            <p>&copy; 2023 SQLWhisperer. All rights reserved.</p>
+            <p>&copy; 2024 Woosh. All rights reserved.</p>
             <div className="flex space-x-4">
               <Button variant="ghost" size="sm">
                 API Documentation
               </Button>
               <Button variant="ghost" size="sm">
                 Privacy Policy
-              </Button>
-              <Button variant="ghost" size="sm">
-                Terms of Service
               </Button>
             </div>
           </div>
