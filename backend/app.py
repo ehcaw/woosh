@@ -1,12 +1,19 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from typing import TypedDict, List
 from langchain_groq import ChatGroq
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, END
 import sqlvalidator
-from functools import lru_cache
+from functools import lru_cache, wraps
 import os
+import json
+from pathlib import Path
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import secrets
 import mysql.connector
 from mysql.connector import Error
 import sqlalchemy
@@ -14,7 +21,9 @@ from sqlalchemy import create_engine, inspect
 from contextlib import contextmanager
 
 app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
 
+# Data Models
 class NLQueryState(TypedDict):
     natural_language_query: str
     sql_query: str
@@ -24,14 +33,56 @@ class NLQueryState(TypedDict):
     error_message: str
     suggested_fix: str
 
-# Database connection management
-def get_db_url():
-    """Construct database URL from environment variables"""
-    return f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+# Database Configuration Class
+class DatabaseConfig:
+    CONFIG_FILE = 'db_config.encrypted'
+    
+    def __init__(self):
+        self.key = self._get_or_create_key()
+        self.fernet = Fernet(self.key)
+        
+    def _get_or_create_key(self):
+        key_file = Path('.env.key')
+        if key_file.exists():
+            return key_file.read_bytes()
+        else:
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b'static_salt',
+                iterations=100000,
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(secrets.token_bytes(32)))
+            key_file.write_bytes(key)
+            return key
+    
+    def save_config(self, config):
+        encrypted_data = self.fernet.encrypt(json.dumps(config).encode())
+        with open(self.CONFIG_FILE, 'wb') as f:
+            f.write(encrypted_data)
+    
+    def load_config(self):
+        try:
+            if not Path(self.CONFIG_FILE).exists():
+                return None
+            with open(self.CONFIG_FILE, 'rb') as f:
+                encrypted_data = f.read()
+            decrypted_data = self.fernet.decrypt(encrypted_data)
+            return json.loads(decrypted_data)
+        except Exception:
+            return None
 
+# Initialize database config manager
+db_config = DatabaseConfig()
+
+# Database connection management
 @contextmanager
 def get_db_connection():
     """Context manager for database connections"""
+    config = db_config.load_config()
+    if not config:
+        raise Exception("Database not configured")
+    
     engine = create_engine(get_db_url())
     try:
         connection = engine.connect()
@@ -40,61 +91,26 @@ def get_db_connection():
         connection.close()
         engine.dispose()
 
-def get_schema_from_db():
-    """Fetch and format schema information from the database"""
-    try:
-        with get_db_connection() as connection:
-            inspector = inspect(connection)
-            schema_info = []
-            
-            # Get all tables
-            for table_name in inspector.get_table_names():
-                columns = inspector.get_columns(table_name)
-                
-                # Format CREATE TABLE statement
-                column_definitions = []
-                for column in columns:
-                    nullable_str = "NULL" if column['nullable'] else "NOT NULL"
-                    default = f"DEFAULT {column['default']}" if column['default'] is not None else ""
-                    column_definitions.append(
-                        f"    {column['name']} {column['type']} {nullable_str} {default}".strip()
-                    )
-                
-                # Get primary key information
-                pk_constraint = inspector.get_pk_constraint(table_name)
-                if pk_constraint and pk_constraint['constrained_columns']:
-                    pk_cols = pk_constraint['constrained_columns']
-                    column_definitions.append(f"    PRIMARY KEY ({', '.join(pk_cols)})")
-                
-                # Get foreign key information
-                for fk in inspector.get_foreign_keys(table_name):
-                    referred_table = fk['referred_table']
-                    constrained_cols = fk['constrained_columns']
-                    referred_cols = fk['referred_columns']
-                    column_definitions.append(
-                        f"    FOREIGN KEY ({', '.join(constrained_cols)}) REFERENCES {referred_table}({', '.join(referred_cols)})"
-                    )
-                
-                create_table = f"CREATE TABLE {table_name} (\n"
-                create_table += ",\n".join(column_definitions)
-                create_table += "\n);"
-                
-                schema_info.append(create_table)
-            
-            return "\n\n".join(schema_info)
-            
-    except Exception as e:
-        print(f"Error fetching schema: {str(e)}")
-        return None
+def get_db_url():
+    """Get database URL from stored configuration"""
+    config = db_config.load_config()
+    if not config:
+        raise Exception("Database not configured")
+    return f"mysql+mysqlconnector://{config['DB_USER']}:{config['DB_PASSWORD']}@{config['DB_HOST']}:{config['DB_PORT']}/{config['DB_NAME']}"
 
-def execute_sql_query(query):
-    """Execute SQL query and return results"""
-    try:
-        with get_db_connection() as connection:
-            result = connection.execute(sqlalchemy.text(query))
-            return [dict(row) for row in result]
-    except Exception as e:
-        raise Exception(f"Error executing query: {str(e)}")
+def requires_db_config(f):
+    """Decorator to check if database is configured"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        config = db_config.load_config()
+        if not config:
+            return jsonify({
+                'error': 'Database not configured',
+                'status': 'error',
+                'code': 'DB_NOT_CONFIGURED'
+            }), 400
+        return f(*args, **kwargs)
+    return decorated_function
 
 # Initialize Groq LLM
 llm = ChatGroq(
@@ -103,7 +119,7 @@ llm = ChatGroq(
     api_key=os.getenv('GROQ_API_KEY')
 )
 
-# Prompts
+# Prompts and Chains setup
 nl_to_sql_prompt = PromptTemplate(
     template="""<|start_of_turn|>system
 You are an expert at converting natural language queries to SQL.
@@ -146,13 +162,11 @@ Return a JSON with:
     input_variables=["query"]
 )
 
-# Chain definitions
 nl_to_sql_chain = nl_to_sql_prompt | llm | JsonOutputParser()
 safety_chain = safety_prompt | llm | JsonOutputParser()
 
 # Node functions
 def convert_nl_to_sql_node(state: NLQueryState):
-    """Convert natural language to SQL"""
     result = nl_to_sql_chain.invoke({
         "query": state["natural_language_query"],
         "schema_info": state["schema_info"]
@@ -163,7 +177,6 @@ def convert_nl_to_sql_node(state: NLQueryState):
     }
 
 def safety_check_node(state: NLQueryState):
-    """Validate query safety"""
     safety_result = safety_chain.invoke({"query": state["sql_query"]})
     return {
         **state,
@@ -199,10 +212,9 @@ def get_compiled_graph():
 
 # API Routes
 @app.route('/health', methods=['GET'])
+@requires_db_config
 def health_check():
-    """Health check endpoint"""
     try:
-        # Test database connection
         with get_db_connection() as connection:
             return jsonify({
                 'status': 'healthy',
@@ -216,9 +228,51 @@ def health_check():
             'database': 'disconnected'
         }), 500
 
+@app.route('/api/v1/database/config', methods=['POST'])
+def configure_database():
+    data = request.get_json()
+    
+    required_fields = ['DB_USER', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT', 'DB_NAME']
+    
+    if not all(field in data for field in required_fields):
+        return jsonify({
+            'error': 'Missing required fields',
+            'required_fields': required_fields,
+            'status': 'error'
+        }), 400
+    
+    try:
+        test_config = {
+            'DB_USER': data['DB_USER'],
+            'DB_PASSWORD': data['DB_PASSWORD'],
+            'DB_HOST': data['DB_HOST'],
+            'DB_PORT': data['DB_PORT'],
+            'DB_NAME': data['DB_NAME']
+        }
+        
+        # Test connection
+        test_url = f"mysql+mysqlconnector://{test_config['DB_USER']}:{test_config['DB_PASSWORD']}@{test_config['DB_HOST']}:{test_config['DB_PORT']}/{test_config['DB_NAME']}"
+        engine = create_engine(test_url)
+        
+        with engine.connect() as connection:
+            pass
+        
+        db_config.save_config(test_config)
+        
+        return jsonify({
+            'message': 'Database configuration saved successfully',
+            'status': 'success'
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'error': f'Failed to connect to database: {str(e)}',
+            'status': 'error'
+        }), 400
+
 @app.route('/api/v1/schema', methods=['GET'])
+@requires_db_config
 def get_schema():
-    """Get database schema"""
     try:
         schema = get_schema_from_db()
         if schema:
@@ -238,8 +292,8 @@ def get_schema():
         }), 500
 
 @app.route('/api/v1/convert', methods=['POST'])
+@requires_db_config
 def convert_to_sql():
-    """Convert natural language to SQL and execute"""
     data = request.get_json()
     
     if not data or 'query' not in data:
@@ -249,7 +303,6 @@ def convert_to_sql():
         }), 400
     
     try:
-        # Get schema
         schema = get_schema_from_db()
         if not schema:
             return jsonify({
@@ -257,10 +310,8 @@ def convert_to_sql():
                 'status': 'error'
             }), 500
         
-        # Get compiled graph
-        app = get_compiled_graph()
+        graph = get_compiled_graph()
         
-        # Process the query
         initial_state = {
             "natural_language_query": data['query'],
             "sql_query": "",
@@ -271,9 +322,8 @@ def convert_to_sql():
             "suggested_fix": ""
         }
         
-        result = app.invoke(initial_state)
+        result = graph.invoke(initial_state)
         
-        # Execute the query if requested and safe
         execute = data.get('execute', False)
         query_results = None
         if execute and result['is_safe']:
@@ -286,7 +336,6 @@ def convert_to_sql():
                     'status': 'error'
                 }), 500
         
-        # Prepare response
         response = {
             'original_query': data['query'],
             'sql_query': result['sql_query'] if result['is_safe'] else result['suggested_fix'],
