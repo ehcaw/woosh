@@ -1,8 +1,16 @@
 from flask import jsonify, request
 from sqlalchemy import inspect
 from functools import wraps
-from .database.config import get_db_connection
-from .langchain_setup import get_compiled_graph, NLQueryState
+
+# Use absolute imports when running as script
+try:
+    from database.config import get_db_connection
+    from langchain_setup import get_compiled_graph, NLQueryState
+except ImportError:
+    from .database.config import get_db_connection
+    from .langchain_setup import get_compiled_graph, NLQueryState
+
+# Rest of the file remains the same...
 
 def requires_db_config(db_config):
     """Decorator factory to check if database is configured"""

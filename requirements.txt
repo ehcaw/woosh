@@ -1,0 +1,9 @@
+flask
+langchain-groq
+langchain
+langgraph
+sqlvalidator
+cryptography
+mysql-connector-python
+sqlalchemy
+python-dotenv

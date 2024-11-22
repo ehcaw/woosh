@@ -2,9 +2,16 @@ import secrets
 from flask import Flask
 from dotenv import load_dotenv
 import os
-from routes import register_routes
-from database.config import DatabaseConfig
-from langchain_setup import init_llm
+
+# Use absolute imports when running as script
+try:
+    from database.config import DatabaseConfig
+    from langchain_setup import init_llm
+    from routes import register_routes
+except ImportError:
+    from .database.config import DatabaseConfig
+    from .langchain_setup import init_llm
+    from .routes import register_routes
 
 # Initialize Flask app
 app = Flask(__name__)
